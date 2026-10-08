@@ -1,0 +1,187 @@
+openapi: 3.0.3
+info:
+  title: "Intent Analyzer (per-agent System 1)"
+  description: |
+    Second-tier System 1 for intent-router-laya worker agents. The router
+    makes 11 coarse routing decisions; each agent's fine-tuned analyzer
+    answers deeper, domain-specific typed decisions before the worker acts.
+    Low-confidence decisions are logged for human review (RLCD loop).
+  version: 0.1.0
+servers:
+  - url: http://localhost:8081
+    description: Local dev
+
+paths:
+  /health:
+    get:
+      summary: Liveness + which analyzers have checkpoints
+      operationId: health
+      responses:
+        '200':
+          description: Service status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+                  agents: {type: array, items: {type: string},
+                           example: [billing, orders, support, account, sales]}
+                  available:
+                    type: object
+                    additionalProperties: {type: boolean}
+                    example: {billing: true, orders: false, support: false,
+                              account: false, sales: false}
+                  checkpoint_dir: {type: string, example: models}
+                  confidence_threshold: {type: number, example: 0.6}
+
+  /analyze:
+    post:
+      summary: Run the worker agent's analyzer on the query
+      operationId: analyze
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AnalyzeRequest'}
+      responses:
+        '200':
+          description: Agent-specific typed decisions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AnalyzeResponse'}
+        '400':
+          description: Unknown worker_agent
+        '503':
+          description: No trained checkpoint for this agent
+
+  /feedback/stats:
+    get:
+      summary: Low-confidence log counters
+      operationId: feedbackStats
+      tags: [Feedback]
+      responses:
+        '200':
+          description: Feedback statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feedback_log: {type: string, example: feedback/analyzer_fallbacks.jsonl}
+                  total_low_confidence: {type: integer, example: 14}
+                  pending_review: {type: integer, example: 9}
+                  approved_for_training: {type: integer, example: 5}
+                  per_agent: {type: object, additionalProperties: {type: integer}}
+
+  /feedback/pending:
+    get:
+      summary: Records awaiting human review (newest first)
+      operationId: feedbackPending
+      tags: [Feedback]
+      parameters:
+        - name: agent
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, default: 50}
+      responses:
+        '200':
+          description: Pending records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pending:
+                    type: array
+                    items: {$ref: '#/components/schemas/FeedbackRecord'}
+
+  /feedback/review/{record_id}:
+    post:
+      summary: Human review gate — approve, correct, or reject
+      operationId: feedbackReview
+      tags: [Feedback]
+      parameters:
+        - name: record_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReviewDecision'}
+      responses:
+        '200':
+          description: Review recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  record_id: {type: string}
+                  decision: {type: string, example: approved}
+        '404':
+          description: Record not found
+
+components:
+  schemas:
+    AnalyzeRequest:
+      type: object
+      required: [query, worker_agent]
+      properties:
+        query: {type: string, minLength: 1, maxLength: 2000,
+                example: I want a refund for the $25 overcharge}
+        worker_agent: {type: string, enum: [billing, orders, support, account, sales],
+                       example: billing}
+        router_context:
+          type: object
+          description: Router output echoed for the feedback log (intent, skill_required, ...)
+          example: {intent: billing_inquiry, skill_required: refund_process, confidence: 0.93}
+
+    AnalyzeResponse:
+      type: object
+      description: |
+        Agent-specific decisions. The choice field name varies per agent:
+        billing_action | order_action | support_topic | account_action | sales_intent.
+        Noul flags vary per agent (see analyzer_questions.py).
+      properties:
+        agent: {type: string, example: billing}
+        choice_question: {type: string, example: billing_action}
+        billing_action: {type: string, example: refund_request,
+                         description: present when agent=billing (name varies per agent)}
+        choice_confidence: {type: number, example: 0.97}
+        choice_probabilities: {type: object, additionalProperties: {type: number}}
+        needs_payment_method: {type: number, example: 0.0}
+        is_dispute: {type: number, example: 0.0}
+        amount_mentioned: {type: number, example: 1.0}
+        is_recurring: {type: number, example: 0.0}
+        needs_human: {type: boolean, example: false,
+                      description: true when choice confidence < threshold — worker must escalate}
+        model: {type: string, example: "analyzer:billing:models/billing"}
+        latency_ms: {type: number, example: 42.5}
+
+    FeedbackRecord:
+      type: object
+      properties:
+        id: {type: string, example: a3f9c1d2e4b5}
+        ts: {type: number}
+        agent: {type: string, example: billing}
+        query: {type: string}
+        decision: {$ref: '#/components/schemas/AnalyzeResponse'}
+        router_context: {type: object}
+        review_status: {type: string, enum: [pending, approved, corrected, rejected]}
+        reviewed_by: {type: string, nullable: true}
+        reviewed_ts: {type: number, nullable: true}
+        corrections: {type: object, nullable: true}
+
+    ReviewDecision:
+      type: object
+      required: [decision]
+      properties:
+        decision: {type: string, enum: [approved, corrected, rejected]}
+        reviewer: {type: string, default: human}
+        corrections: {type: object, nullable: true,
+                      description: human label overrides; win at export}

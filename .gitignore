@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+# Large artifacts: regenerable, not for git
+model-hub/
+models/
+train/data/
+train/__pycache__/
+feedback/
+# Editor
+.vscode/
+.idea/
+*.swp
