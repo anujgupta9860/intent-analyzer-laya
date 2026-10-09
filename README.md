@@ -163,6 +163,29 @@ docs/SDR.md                # design doc
 openapi.yaml               # API spec
 ```
 
+## Trained checkpoints
+
+All 5 per-agent analyzers are trained (ModernBERT-base, 5 epochs each) and
+published on GCS. Each prefix holds the serving files only
+(`pytorch_model.bin`, `config.json`, `tokenizer.json`,
+`tokenizer_config.json`, `calibration.json`):
+
+| Agent | GCS path |
+|---|---|
+| billing | `gs://laya-checkpoints-anuj/intent-analyzer/billing/` |
+| orders | `gs://laya-checkpoints-anuj/intent-analyzer/orders/` |
+| support | `gs://laya-checkpoints-anuj/intent-analyzer/support/` |
+| account | `gs://laya-checkpoints-anuj/intent-analyzer/account/` |
+| sales | `gs://laya-checkpoints-anuj/intent-analyzer/sales/` |
+
+```bash
+# download one agent's serving weights
+gsutil -m cp -r gs://laya-checkpoints-anuj/intent-analyzer/billing/ ./models/billing/
+```
+
+Checkpoints are git-ignored (each ~600MB); the training datasets are
+committed and the models are reproducible via `train/finetune.py`.
+
 ## Notes
 
 - Mirrors intent-router-laya's typed-decision pattern and the
