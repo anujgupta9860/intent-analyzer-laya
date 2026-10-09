@@ -248,3 +248,205 @@ improvement.
   one analyzer per query; router-side decomposition is future work.
 - Score-type questions (like the router's guardrail) per agent —
   deferred until a domain needs graded risk, not just flags.
+
+## 10. Diagrams
+
+### 10.1 System architecture (components)
+
+```mermaid
+flowchart TB
+    subgraph Client["Client / Worker Agents"]
+        Billing["Billing Agent"]
+        Orders["Orders Agent"]
+        Support["Support Agent"]
+        Account["Account Agent"]
+        Sales["Sales Agent"]
+    end
+
+    subgraph Router["Intent Router (Tier 1 System 1)"]
+        R1["11 typed decisions\nintent, worker_agent, skill_required,\nneeds_human, guardrail, ..."]
+    end
+
+    subgraph AnalyzerSvc["Intent Analyzer Service (Tier 2 System 1)"]
+        API["POST /analyze"]
+        Reg["AnalyzerRegistry\n(lazy per-agent pool)"]
+        B["Billing\nAnalyzer"]
+        O["Orders\nAnalyzer"]
+        S["Support\nAnalyzer"]
+        A["Account\nAnalyzer"]
+        Sa["Sales\nAnalyzer"]
+    end
+
+    subgraph Models["Model storage"]
+        GCS["GCS\nintent-analyzer/{agent}/"]
+        Local["Local models/{agent}/\npytorch_model.bin + calibration.json"]
+    end
+
+    subgraph FeedbackSys["RLCD feedback loop"]
+        FB["Feedback log\n(low-confidence decisions)"]
+        HR["Human review\napprove / correct / reject"]
+        TR["Retraining\n(finetune.py)"]
+    end
+
+    Billing -->|query + worker_agent| API
+    Orders -->|query + worker_agent| API
+    Support -->|query + worker_agent| API
+    Account -->|query + worker_agent| API
+    Sales -->|query + worker_agent| API
+
+    API --> Reg
+    Reg --> B & O & S & A & Sa
+
+    GCS -->|entrypoint.py\non deploy| Local
+    Local -->|torch.load| B & O & S & A & Sa
+
+    B & O & S & A & Sa -->|confidence < 0.6| FB
+    FB --> HR --> TR --> GCS
+
+    R1 -.->|worker_agent + skill| API
+```
+
+### 10.2 Request flow (flowchart)
+
+```mermaid
+flowchart TD
+    Q["User query"] --> Router["Intent Router\n(11 decisions)"]
+    Router -->|worker_agent = billing| Svc["POST /analyze\n{query, worker_agent}"]
+    Svc --> Reg{"AnalyzerRegistry:\ncheckpoint loaded?"}
+    Reg -->|No| Load["Load from models/billing/\n+ validate vs question spec"]
+    Reg -->|Yes| Inf
+    Load --> Inf["One forward pass\n(shared encoder)"]
+    Inf --> Choice["Choice head\nsoftmax(logits / T)"]
+    Inf --> Noul["Noul heads\nsigmoid(logits / T_i)"]
+    Choice --> Conf{"confidence >= 0.6?"}
+    Conf -->|Yes| Done["Return decision\nto worker agent"]
+    Conf -->|No| Log["Log to feedback\nneeds_human = true"]
+    Log --> Human["Human review"]
+    Done --> Worker["Worker agent acts\n(refined action + flags)"]
+```
+
+### 10.3 Sequence diagram (full request)
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant R as Intent Router
+    participant A as Analyzer Service
+    participant Reg as AnalyzerRegistry
+    participant M as Billing Model
+    participant W as Billing Worker
+
+    U->>R: "I want a refund for the $25 overcharge"
+    R->>R: 11 typed decisions
+    R->>A: POST /analyze {query, worker_agent: billing,<br/>router_context: {intent, skill, confidence}}
+    A->>Reg: get("billing")
+    alt first use
+        Reg->>M: _ensure_loaded()<br/>validate vs spec, torch.load, eval()
+    end
+    Reg->>M: analyze(query)
+    M->>M: tokenize → forward pass →<br/>softmax/sigmoid with temperatures
+    M-->>A: refund_request @ 0.781,<br/>amount_mentioned=0.9, is_dispute=0.2
+    alt confidence >= 0.6
+        A-->>W: decision (act on it)
+        W->>W: process refund ($25, account lookup)
+    else confidence < 0.6
+        A->>A: log to feedback (needs_human=true)
+        A-->>W: escalate — do not execute
+    end
+```
+
+### 10.4 System 1 vs System 2 (two-tier decisions)
+
+```mermaid
+flowchart LR
+    subgraph T1["Tier 1 — Router System 1 (broad)"]
+        direction TB
+        Q1["11 coarse decisions"]
+        Q1 --> W["which worker?"]
+        Q1 --> Sk["which skill?"]
+        Q1 --> G["guardrail?"]
+        Q1 --> H["needs human?"]
+    end
+
+    subgraph T2["Tier 2 — Analyzer System 1 (narrow, per agent)"]
+        direction TB
+        Q2["Agent-specific decisions"]
+        Q2 --> BA["billing_action?"]
+        Q2 --> PM["needs_payment_method?"]
+        Q2 --> ID["is_dispute?"]
+    end
+
+    subgraph S2["System 2 — Gemma (LLM, expensive)"]
+        direction TB
+        L["Full reasoning"]
+        L --> R2["confirm / override / escalate"]
+    end
+
+    T1 -->|confident| T2
+    T1 -->|uncertain| S2
+    T2 -->|confident| Act["Worker acts"]
+    T2 -->|uncertain| S2
+    S2 -->|logged| FB["Feedback → human review → retrain"]
+    FB -.->|improves| T1
+    FB -.->|improves| T2
+```
+
+### 10.5 RLCD feedback loop
+
+```mermaid
+flowchart TD
+    Inf["Inference\n(cheap, fast)"] --> Conf{"confidence >= 0.6?"}
+    Conf -->|Yes| Serve["Serve decision"]
+    Conf -->|No| Log["Log: query + all decisions\n+ router_context"]
+    Log --> Queue["Review queue\nGET /rlcd/review"]
+    Queue --> Human{"Human review"}
+    Human -->|Approve| Train
+    Human -->|Correct| Train
+    Human -->|Reject| Drop["Dropped"]
+    Train["Export approved\n→ finetune.py"] --> New["New checkpoint"]
+    New --> GCS["GCS\nintent-analyzer/{agent}/"]
+    GCS --> Deploy["Redeploy /\nentrypoint download"]
+    Deploy --> Inf
+```
+
+### 10.6 Model lifecycle
+
+```mermaid
+flowchart LR
+    Data["Synthetic dataset\nbuild_dataset.py"] --> Train["finetune.py\n(CPU, ~7 min)"]
+    Train --> Cal["calibration.json\n(temperatures)"]
+    Train --> Weights["pytorch_model.bin\n(569MB)"]
+    Cal & Weights --> GCS["GCS\nintent-analyzer/{agent}/"]
+    GCS --> Entry["entrypoint.py\n(download on deploy)"]
+    Entry --> Local["Local models/{agent}/"]
+    Local --> Reg["AnalyzerRegistry\nlazy load + spec validation"]
+    Reg --> Inf["Inference\n(ms per query)"]
+```
+
+### 10.7 Deployment topology
+
+```mermaid
+flowchart TB
+    subgraph GCP["GCP — Innovation Lab"]
+        subgraph GCSB["Cloud Storage"]
+            RM["laya-checkpoints-anuj/\nintent-analyzer/{billing,orders,...}/"]
+        end
+        subgraph CR["Cloud Run"]
+            Svc["intent-analyzer service\n(entrypoint.py → uvicorn)"]
+        end
+    end
+
+    subgraph GH["GitHub"]
+        Repo["intent-analyzer-laya\n(code, SDR, datasets)"]
+    end
+
+    subgraph Dev["Developer machine"]
+        Tr["train/finetune.py"]
+    end
+
+    Dev -->|train| Tr
+    Tr -->|upload serving files| RM
+    GH -->|code (no binaries)| Svc
+    RM -->|entrypoint download| Svc
+    Svc -->|POST /analyze| Client["Worker agents"]
+```
