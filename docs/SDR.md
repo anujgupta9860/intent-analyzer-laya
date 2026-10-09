@@ -132,6 +132,27 @@ POST /analyze
 - `needs_human=true` (choice confidence < 0.6) → the worker must
   escalate, not execute. The decision is logged for human review.
 
+### 4.5b Model access per agent
+
+A worker agent never touches model files directly — it calls the analyzer
+service, which owns checkpoint lifecycle:
+
+1. **Service API (normal path):** `POST /analyze {"query", "worker_agent"}`.
+   The registry lazy-loads the agent's checkpoint on first use and
+   validates it against `src/analyzer_questions.py` (choice labels, noul
+   questions, agent name) before serving. A mismatched checkpoint is
+   rejected, not silently served — the 2026-10-07 router lesson.
+2. **GCS at deploy time:** `entrypoint.py` downloads each agent's
+   checkpoint from `gs://laya-checkpoints-anuj/intent-analyzer/{agent}/`
+   into `$ANALYZER_CHECKPOINT_DIR/{agent}/` on container startup (skips
+   agents already present). Env: `ANALYZER_CHECKPOINT_GCS`,
+   `ANALYZER_CHECKPOINT_DIR`, `ANALYZER_AGENTS`.
+3. **Direct:** `gsutil -m cp -r gs://laya-checkpoints-anuj/intent-analyzer/billing ./models/billing`
+   then `AnalyzerRegistry("models")` in Python or `ANALYZER_CHECKPOINT_DIR`
+   for the service. Each agent dir holds `pytorch_model.bin`,
+   `config.json`, `tokenizer.json`, `tokenizer_config.json`,
+   `calibration.json` (~570MB/agent).
+
 ### 4.6 Fallback / escalation policy
 
 | Signal | Action |

@@ -57,6 +57,66 @@ ANALYZER_CHECKPOINT_DIR=models uvicorn src.app:app --port 8081
 python -m pytest tests/ -q
 ```
 
+## How each agent accesses its model
+
+Three ways, from most to least abstracted:
+
+**1. Via the analyzer service (recommended).** A worker agent never touches
+model files — it calls the analyzer service with its agent name:
+
+```bash
+curl -s -X POST localhost:8081/analyze \
+  -H 'content-type: application/json' \
+  -d '{"query": "I want a refund for the $25 overcharge", "worker_agent": "billing"}' \
+  | python3 -m json.tool
+# -> billing_action: refund_request @ 0.781, amount_mentioned, is_dispute, ...
+```
+
+The service lazy-loads each agent's checkpoint on first use and validates
+it against the question spec (`src/analyzer_questions.py`) before serving —
+a checkpoint trained for the wrong agent is rejected, not silently served.
+
+**2. GCS download (deployments).** `entrypoint.py` pulls every agent's
+checkpoint from GCS at container startup (skips agents already present):
+
+```bash
+# env knobs
+ANALYZER_CHECKPOINT_GCS=gs://laya-checkpoints-anuj/intent-analyzer/
+ANALYZER_CHECKPOINT_DIR=/srv/app/models
+ANALYZER_AGENTS=billing,orders,support,account,sales
+
+python entrypoint.py   # downloads, then execs uvicorn
+```
+
+Trained checkpoints (upload in progress):
+
+| Agent | GCS path |
+|---|---|
+| billing | `gs://laya-checkpoints-anuj/intent-analyzer/billing/` |
+| orders | `gs://laya-checkpoints-anuj/intent-analyzer/orders/` |
+| support | `gs://laya-checkpoints-anuj/intent-analyzer/support/` |
+| account | `gs://laya-checkpoints-anuj/intent-analyzer/account/` |
+| sales | `gs://laya-checkpoints-anuj/intent-analyzer/sales/` |
+
+Each holds: `pytorch_model.bin`, `config.json`, `tokenizer.json`,
+`tokenizer_config.json`, `calibration.json` (~570MB per agent).
+
+**3. Direct local access.** Download once, point at it:
+
+```bash
+gsutil -m cp -r gs://laya-checkpoints-anuj/intent-analyzer/billing ./models/billing
+ANALYZER_CHECKPOINT_DIR=./models uvicorn src.app:app --port 8081
+```
+
+Or load in Python without the service:
+
+```python
+from src.analyzers import AnalyzerRegistry
+reg = AnalyzerRegistry("models")          # one subdir per agent
+out = reg.get("billing").analyze("I want a refund for the $25 overcharge")
+print(out["billing_action"], out["confidence"])
+```
+
 ## Curl examples
 
 ```bash
